@@ -91,10 +91,20 @@ button.addEventListener("click", async () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload)
     });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || "검증에 실패했습니다.");
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      throw new Error(`서버가 예상하지 못한 응답을 보냈습니다. HTTP ${res.status}`);
+    }
+    if (!data.ok) {
+      showStatus(data.error || "검증에 실패했습니다.", "error");
+      if (data.suggestion) showStatus(`${data.error} ${data.suggestion}`, "error");
+      return;
+    }
     render(data);
-    showStatus(`${data.results.length}개의 주장에 대해 검증 결과를 만들었습니다.`, "success");
+    const readMethod = data.fetched?.method === "jina-reader" ? "보조 원문 읽기" : "원문 직접 읽기";
+    showStatus(`${data.results.length}개의 주장에 대해 검증 결과를 만들었습니다.${data.fetched ? ` (${readMethod})` : ""}`, "success");
   } catch (e) {
     showStatus(e.message || "오류가 발생했습니다.", "error");
   } finally {
@@ -110,7 +120,7 @@ function showStatus(msg, kind) {
 function render(data) {
   resultEl.classList.remove("hidden");
   const sourceInfo = data.fetched
-    ? `<div class="meta">불러온 출처: <b>${esc(data.fetched.host)}</b>${data.fetched.title ? ` · ${esc(data.fetched.title)}` : ""}</div>`
+    ? `<div class="meta">불러온 출처: <b>${esc(data.fetched.host)}</b>${data.fetched.title ? ` · ${esc(data.fetched.title)}` : ""}${data.fetched.method === "jina-reader" ? " · 보조 읽기 사용" : ""}</div>`
     : `<div class="meta">사용자 입력 자료를 대상으로 검증했습니다.</div>`;
 
   let html = `<div class="summary"><strong>검증 결과</strong>${sourceInfo}<div class="caution">${esc(data.note)}</div></div>`;

@@ -1,10 +1,17 @@
 const APP_NAME = "근거 기반 자료 검증기";
 const MAX_TEXT = 18000;
 const MAX_CLAIMS = 5;
+const MAX_HTML = 1400000;
+const FETCH_TIMEOUT_MS = 15000;
+const JINA_READER = "https://r.jina.ai/";
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    if (url.pathname === "/api/health" && request.method === "GET") {
+      return json({ ok: true, app: APP_NAME, version: "1.1-fixed" });
+    }
 
     if (url.pathname === "/api/check" && request.method === "POST") {
       try {
@@ -16,16 +23,25 @@ export default {
         let articleText = inputText;
         let fetched = null;
         if (sourceUrl) {
-          fetched = await fetchArticle(sourceUrl);
-          if (!articleText) articleText = fetched.text;
+          try {
+            fetched = await fetchArticle(sourceUrl);
+            if (!articleText) articleText = fetched.text;
+          } catch (err) {
+            return json({
+              ok: false,
+              error: "이 웹페이지의 원문을 가져오지 못했습니다.",
+              detail: String(err?.message || err),
+              suggestion: "사이트가 자동 읽기를 막았거나 페이지가 동적으로 만들어지는 경우가 있습니다. '본문을 붙여넣어 검증' 방법으로 같은 내용을 넣어 다시 확인해 주세요."
+            }, 200);
+          }
         }
 
-        if (!articleText) {
-          return json({ ok: false, error: "URL 또는 검증할 자료를 입력해 주세요." }, 400);
+        if (!manualClaim && !articleText) {
+          return json({ ok: false, error: "URL 또는 검증할 자료를 입력해 주세요." }, 200);
         }
 
         articleText = cleanText(articleText).slice(0, MAX_TEXT);
-        const claims = manualClaim ? [manualClaim] : extractClaims(articleText, MAX_CLAIMS);
+        const claims = manualClaim ? [manualClaim.slice(0, 700)] : extractClaims(articleText, MAX_CLAIMS);
         if (!claims.length) {
           return json({ ok: false, error: "검증할 주장 문장을 찾지 못했습니다. 한두 문장의 핵심 주장을 직접 입력해 보세요." }, 400);
         }
@@ -39,13 +55,18 @@ export default {
         return json({
           ok: true,
           app: APP_NAME,
-          fetched: fetched ? { url: sourceUrl, title: fetched.title, host: safeHost(sourceUrl) } : null,
+          fetched: fetched ? { url: sourceUrl, title: fetched.title, host: safeHost(sourceUrl), method: fetched.method || "direct" } : null,
           claims,
           results,
           note: "이 도구는 자동 판정 보조 도구입니다. 검색 결과와 원문을 직접 확인하세요."
         });
       } catch (err) {
-        return json({ ok: false, error: "검증 중 오류가 발생했습니다.", detail: String(err?.message || err) }, 500);
+        return json({
+          ok: false,
+          error: "검증 중 예기치 않은 오류가 발생했습니다.",
+          detail: String(err?.message || err),
+          suggestion: "입력 내용을 확인하고 다시 시도해 주세요. 계속되면 본문 붙여넣기 방법을 사용해 보세요."
+        }, 200);
       }
     }
 
@@ -220,16 +241,79 @@ async function fetchArticle(sourceUrl) {
   try { u = new URL(sourceUrl); } catch { throw new Error("URL 형식이 올바르지 않습니다."); }
   if (!/^https?:$/.test(u.protocol)) throw new Error("http 또는 https URL만 사용할 수 있습니다.");
 
-  const res = await fetch(u, {
-    redirect: "follow",
-    headers: {
-      "user-agent": "Mozilla/5.0 FactCheckerFree/1.0",
-      "accept": "text/html,application/xhtml+xml"
+  let direct = null;
+  try {
+    direct = await fetchWithTimeout(u.href, {
+      redirect: "follow",
+      headers: {
+        "user-agent": "Mozilla/5.0 FactCheckerFree/2.0",
+        "accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5"
+      }
+    });
+  } catch {
+    direct = null;
+  }
+
+  if (direct?.ok) {
+    const html = await readLimitedText(direct, MAX_HTML);
+    const text = extractReadableText(html);
+    if (text.length >= 120) {
+      return { title: extractTitle(html), text, method: "direct" };
     }
-  });
-  if (!res.ok) throw new Error(`원문을 가져오지 못했습니다. HTTP ${res.status}`);
-  const html = await res.text();
-  return { title: extractTitle(html), text: extractReadableText(html) };
+  }
+
+  // Many news/government sites block server-side scraping or render the article with JavaScript.
+  // Jina Reader is a free basic URL reader and is used only as a fallback.
+  const readerUrl = JINA_READER + encodeURIComponent(u.href);
+  let reader = null;
+  try {
+    reader = await fetchWithTimeout(readerUrl, {
+      headers: {
+        "accept": "text/plain,text/markdown;q=0.9,*/*;q=0.5",
+        "x-engine": "browser",
+        "x-timeout": "15"
+      }
+    });
+  } catch {
+    reader = null;
+  }
+  if (reader?.ok) {
+    const content = cleanText(await readLimitedText(reader, MAX_TEXT));
+    if (content.length >= 120) {
+      return { title: titleFromReader(content) || u.hostname, text: content, method: "jina-reader" };
+    }
+  }
+
+  const directStatus = direct ? `직접 읽기 HTTP ${direct.status}` : "직접 읽기 실패/시간초과";
+  const readerStatus = reader ? `보조 읽기 HTTP ${reader.status}` : "보조 읽기 실패/시간초과";
+  throw new Error(`${directStatus}; ${readerStatus}`);
+}
+
+async function fetchWithTimeout(input, init = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") throw new Error("요청 시간이 초과되었습니다.");
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readLimitedText(res, limit) {
+  const text = await res.text();
+  return text.slice(0, limit);
+}
+
+function titleFromReader(content) {
+  const lines = content.split(/\n+/).map(x => x.trim()).filter(Boolean);
+  for (const line of lines.slice(0, 8)) {
+    const t = line.replace(/^#+\s*/, "").trim();
+    if (t.length >= 4 && t.length <= 220 && !/^https?:\/\//i.test(t)) return t;
+  }
+  return "";
 }
 
 function extractReadableText(html) {
@@ -247,7 +331,7 @@ function extractReadableText(html) {
   let match = null;
   for (const re of candidates) {
     const m = s.match(re);
-    if (m && m[1] && m[1].length > 500) { match = m[1]; break; }
+    if (m && m[1] && m[1].length > 120) { match = m[1]; break; }
   }
   const chosen = match || s;
   return cleanText(chosen.replace(/<[^>]+>/g, " "));
