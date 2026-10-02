@@ -127,14 +127,14 @@ function render(data) {
   data.results.forEach((r, i) => {
     const cls = r.verdict.includes("반박") ? "false" : r.verdict.includes("지지") ? "true" : r.verdict.includes("일부") ? "mixed" : "";
     html += `<article class="claim-card"><p class="claim">${i + 1}. ${esc(r.claim)}</p><span class="verdict ${cls}">${esc(r.verdict)}</span><div class="meta"><b>판정 이유:</b> ${esc(r.reason)}<br><b>판정 근거:</b> ${esc(r.basis)}</div>`;
-    html += `<div class="sources"><div class="source-group"><h3>기존 팩트체크 자료</h3>${renderFactChecks(r.factChecks)}</div><div class="source-group"><h3>관련 웹 검색 결과</h3>${renderEvidence(r.evidence)}</div></div>`;
+    html += `<div class="sources"><div class="source-group"><h3>확인된 팩트체크 신호</h3>${renderFactChecks(r.factChecks)}</div><div class="source-group"><h3>관련 웹 검색 결과</h3>${renderEvidence(r.evidence)}</div></div>`;
     html += `<div class="caution">${esc(r.caution)}</div></article>`;
   });
   resultEl.innerHTML = html;
 }
 
 function renderFactChecks(items) {
-  if (!items.length) return `<div class="empty">일치하는 기존 팩트체크 자료를 찾지 못했습니다. 검색 결과가 없다고 해서 거짓이라는 뜻은 아닙니다.</div>`;
+  if (!items.length) return `<div class="empty">명시적인 팩트체크 판정 자료를 찾지 못했습니다. 이것만으로 거짓이라고 판단하지 않습니다.</div>`;
   return items.map(item => `<div class="source"><div><b>${esc(item.claim || "관련 주장")}</b></div>${(item.reviews || []).map(rv => `<div style="margin-top:7px"><a href="${safeUrl(rv.url)}" target="_blank" rel="noopener noreferrer">${esc(rv.title || rv.publisher || rv.url)}</a><div class="host">${esc(rv.publisher || "")} · ${esc(rv.date || "")}</div><div class="rating">판정: ${esc(rv.rating || "표기 없음")}</div></div>`).join("")}</div>`).join("");
 }
 

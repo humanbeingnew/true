@@ -4,13 +4,15 @@ const MAX_CLAIMS = 5;
 const MAX_HTML = 1400000;
 const FETCH_TIMEOUT_MS = 15000;
 const JINA_READER = "https://r.jina.ai/";
+const MAX_FACTCHECK_ARTICLES = 2;
+const MAX_EVIDENCE_RESULTS = 12;
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/api/health" && request.method === "GET") {
-      return json({ ok: true, app: APP_NAME, version: "1.1-fixed" });
+      return json({ ok: true, app: APP_NAME, version: "1.2-evidence" });
     }
 
     if (url.pathname === "/api/check" && request.method === "POST") {
@@ -80,29 +82,37 @@ async function verifyClaim(claim, env) {
     : [];
 
   const searches = await Promise.all([
-    googleNewsSearch(claim),
-    googleNewsSearch(`${claim} 팩트체크`),
-    googleNewsSearch(`\"${trimForSearch(claim)}\"`)
+    googleNewsSearch(`${trimForSearch(claim)} 팩트체크`),
+    googleNewsSearch(trimForSearch(claim)),
+    googleNewsSearch(`${trimForSearch(claim)} 사실 거짓 반박`)
   ]);
-  const evidence = dedupeResults(searches.flat()).slice(0, 12);
 
-  const verdict = deriveVerdict(factChecks, evidence);
+  const factSearch = dedupeResults(searches[0]);
+  const evidence = dedupeResults(searches.flat()).slice(0, MAX_EVIDENCE_RESULTS);
+
+  // API key가 없어도 무료 RSS 결과의 '팩트체크 기사 제목 + 원문'에서
+  // 명시적인 판정 표현을 찾아 1차 판정을 만들 수 있게 합니다.
+  const explicitChecks = await inspectFactCheckArticles(factSearch);
+  const allFactSignals = [...explicitChecks, ...factChecks];
+  const verdict = deriveVerdict(factChecks, evidence, explicitChecks);
+
   return {
     claim,
     verdict: verdict.label,
     reason: verdict.reason,
     basis: verdict.basis,
-    factChecks,
+    factChecks: factChecks.length ? factChecks : explicitChecks,
     evidence,
+    factSignals: explicitChecks,
     caution: verdict.caution
   };
 }
 
-function deriveVerdict(factChecks, evidence) {
-  const ratings = factChecks
-    .flatMap(x => x.reviews || [])
-    .map(r => normalizeRating(r.rating))
-    .filter(Boolean);
+function deriveVerdict(factChecks, evidence, explicitChecks = []) {
+  const ratings = [
+    ...factChecks.flatMap(x => x.reviews || []).map(r => normalizeRating(r.rating)),
+    ...explicitChecks.map(x => x.rating)
+  ].filter(Boolean);
 
   const falseCount = ratings.filter(x => x === "false").length;
   const trueCount = ratings.filter(x => x === "true").length;
@@ -111,52 +121,114 @@ function deriveVerdict(factChecks, evidence) {
   if (falseCount >= 1 && falseCount >= trueCount && falseCount >= mixedCount) {
     return {
       label: "반박됨",
-      reason: "기존 팩트체크 자료에서 이 주장과 일치하는 반박 판정이 확인되었습니다.",
-      basis: "외부 팩트체크 데이터",
-      caution: "팩트체크 기관의 판정을 원문과 함께 확인하세요. 기관마다 평가 기준과 표현이 다를 수 있습니다."
+      reason: "관련 팩트체크 자료에서 이 주장에 대한 명시적인 반박 판정 신호가 확인되었습니다.",
+      basis: "팩트체크 자료의 명시적 판정 표현",
+      caution: "자동 판정은 참고용입니다. 원문과 팩트체크 기사에서 날짜, 수치, 인용 맥락을 직접 확인하세요."
     };
   }
   if (trueCount >= 1 && trueCount > falseCount && trueCount >= mixedCount) {
     return {
       label: "지지되는 근거 있음",
-      reason: "기존 팩트체크 자료에서 이 주장과 일치하는 긍정 판정이 확인되었습니다.",
-      basis: "외부 팩트체크 데이터",
-      caution: "'지지됨'은 모든 맥락에서 절대적으로 참이라는 뜻이 아닙니다. 날짜와 범위를 확인하세요."
+      reason: "관련 팩트체크 자료에서 이 주장과 부합하는 명시적 사실 판정 신호가 확인되었습니다.",
+      basis: "팩트체크 자료의 명시적 판정 표현",
+      caution: "'지지되는 근거 있음'은 모든 맥락에서 절대적으로 참이라는 뜻이 아닙니다. 날짜와 범위를 확인하세요."
     };
   }
   if (mixedCount >= 1) {
     return {
       label: "일부만 맞을 가능성",
-      reason: "기존 팩트체크 자료에 혼합·부분 사실 유형의 판정이 확인되었습니다.",
-      basis: "외부 팩트체크 데이터",
-      caution: "주장의 일부만 맞거나 맥락에 따라 달라질 수 있습니다."
+      reason: "관련 팩트체크 자료에서 부분 사실·혼합 판정 신호가 확인되었습니다.",
+      basis: "팩트체크 자료의 명시적 판정 표현",
+      caution: "주장의 일부만 맞거나 표현이 과장되었을 수 있습니다. 검증 기사에서 어떤 부분이 맞고 틀린지 확인하세요."
     };
   }
 
   const strong = evidence.filter(x => isStrongSource(x.host));
-  if (strong.length >= 2) {
+  const distinctHosts = new Set(evidence.map(x => x.host).filter(Boolean));
+
+  // 기존에는 '강한 출처 2개'라는 매우 좁은 조건만 사용해서,
+  // 검색 결과가 있어도 거의 전부 '판단 보류'가 되었습니다.
+  // 이제는 직접 판정을 찾지 못했더라도 실제 관련 자료가 여러 개면
+  // '추가 확인 필요'로 올려 사용자가 근거를 볼 수 있게 합니다.
+  if (strong.length >= 1 || distinctHosts.size >= 2 || evidence.length >= 3) {
     return {
       label: "추가 확인 필요",
-      reason: "관련 자료는 찾았지만 검색 결과만으로 사실 여부를 확정하지 않았습니다.",
-      basis: "웹 검색 결과",
-      caution: "검색 결과 제목·요약문은 증거 자체가 아닙니다. 원문에서 숫자, 날짜, 인용의 맥락을 확인하세요."
+      reason: `직접적인 사실/거짓 판정은 확인되지 않았지만 관련 자료 ${evidence.length}건에서 추가 확인할 근거를 찾았습니다.`,
+      basis: "복수 웹 자료와 출처 교차 확인 필요",
+      caution: "검색 결과의 제목이나 검색 순위만으로 참·거짓을 확정하지 않습니다. 핵심 수치와 원문 근거를 직접 대조하세요."
     };
   }
 
   return {
     label: "판단 보류",
-    reason: "직접적인 팩트체크 판정이나 충분한 독립 근거를 찾지 못했습니다.",
+    reason: "관련 자료 자체를 충분히 찾지 못해 자동 판정을 만들기 어렵습니다.",
     basis: "근거 부족",
-    caution: "정보가 없다는 것이 거짓이라는 뜻은 아닙니다. 추가 출처가 필요합니다."
+    caution: "판단 보류는 거짓이라는 뜻이 아닙니다. 검색어를 더 구체화하거나 다른 출처를 추가하세요."
   };
 }
 
-function normalizeRating(rating = "") {
-  const s = String(rating).toLowerCase().replace(/\s+/g, " ").trim();
-  if (/false|거짓|사실 아님|틀림|거짓에 가까움|대부분 거짓|거짓 또는 오해/.test(s)) return "false";
-  if (/true|참|사실|맞음|대체로 사실|대부분 사실/.test(s) && !/부분|혼합|거짓/.test(s)) return "true";
-  if (/mixed|half true|partly|부분|절반|혼합|맥락 필요/.test(s)) return "mixed";
+async function inspectFactCheckArticles(items) {
+  const candidates = items
+    .filter(isLikelyFactCheck)
+    .slice(0, MAX_FACTCHECK_ARTICLES);
+
+  const inspected = [];
+  for (const item of candidates) {
+    const text = await fetchEvidenceText(item.url);
+    const sourceText = `${item.title}\n${text || ""}`;
+    const rating = detectExplicitRating(sourceText);
+    if (!rating) continue;
+    inspected.push({
+      claim: item.title,
+      claimant: "",
+      date: item.date || "",
+      reviews: [{
+        publisher: item.publisher || item.host || "",
+        title: item.title,
+        url: item.url,
+        date: item.date || "",
+        rating: rating === "false" ? "사실 아님/반박" : rating === "true" ? "사실" : "부분 사실/혼합"
+      }],
+      rating
+    });
+  }
+  return inspected;
+}
+
+function isLikelyFactCheck(item) {
+  const blob = `${item.title || ""} ${item.publisher || ""} ${item.host || ""}`.toLowerCase();
+  return /팩트체크|사실확인|검증|fact ?check|factcheck/.test(blob)
+    || /factcheckkorea\.afp\.com|factcheck\.org|snopes\.com|politifact\.com|factcheck\.snu\.ac\.kr/.test(item.host || "");
+}
+
+function detectExplicitRating(text) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  if (!s) return null;
+
+  // 부정 표현을 먼저 검사해 '사실'이라는 단어가 함께 있어도 잘못 긍정하지 않도록 합니다.
+  if (/(사실이\s*(아니다|아님)|사실\s*아님|거짓|허위|오보|가짜|틀린\s*주장|잘못된\s*주장|근거\s*없|사실무근|반박|사실과\s*다르|허위정보|거짓정보)/i.test(s)) return "false";
+  if (/(일부\s*사실|부분적으로\s*사실|절반의\s*사실|대체로\s*사실|과장된\s*주장|맥락이\s*필요|오해의\s*소지)/i.test(s)) return "mixed";
+  if (/(사실로\s*(확인|판명)|사실\s*확인|맞는\s*주장|사실이다|사실임|대체로\s*사실)/i.test(s)) return "true";
   return null;
+}
+
+async function fetchEvidenceText(url) {
+  if (!/^https?:\/\//i.test(url || "")) return "";
+  try {
+    const res = await fetchWithTimeout(url, {
+      redirect: "follow",
+      headers: {
+        "user-agent": "Mozilla/5.0 FactCheckerFree/2.0",
+        "accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5"
+      }
+    });
+    if (!res.ok) return "";
+    const raw = await readLimitedText(res, 120000);
+    const text = /<html|<article|<main/i.test(raw) ? extractReadableText(raw) : cleanText(raw);
+    return text.slice(0, 30000);
+  } catch {
+    return "";
+  }
 }
 
 async function searchGoogleFactChecks(query, key) {
@@ -217,18 +289,27 @@ function parseRss(xml) {
     const link = xmlTag(item, "link");
     const pubDate = xmlTag(item, "pubDate");
     const source = xmlTag(item, "source");
+    const sourceUrl = xmlAttr(item, "source", "url");
+    const publisher = decodeXml(source || "");
+    const host = hostFromUrl(sourceUrl || link);
     if (title && link) {
       out.push({
         title: decodeXml(title),
         url: decodeXml(link),
         date: pubDate ? decodeXml(pubDate) : "",
-        publisher: decodeXml(source || ""),
-        host: hostFromUrl(link),
+        publisher,
+        host,
+        sourceUrl: sourceUrl || "",
         type: "web-search"
       });
     }
   }
   return out;
+}
+
+function xmlAttr(s, tag, attr) {
+  const m = s.match(new RegExp(`<${tag}[^>]*\\b${attr}=["']([^"']+)["'][^>]*>`, "i"));
+  return m ? decodeXml(m[1]) : "";
 }
 
 function xmlTag(s, tag) {
