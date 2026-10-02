@@ -1,0 +1,9 @@
+name = "fact-checker-free-v1"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[assets]
+directory = "./public"
+
+[vars]
+APP_NAME = "근거 기반 자료 검증기"
