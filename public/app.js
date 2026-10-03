@@ -25,6 +25,8 @@ function render(data){
   let html=`<div class="summary"><strong>관련 자료 모음</strong><div class="meta">${data.fetched?`입력 자료: <b>${esc(data.fetched.host)}</b>${data.fetched.title?` · ${esc(data.fetched.title)}`:''}`:'입력 자료를 바탕으로 주제를 만들었습니다.'}</div>`;
   if(data.topics?.length){html+=`<div class="topic-box"><div class="meta"><b>검색에 사용한 핵심 주제</b></div>${data.topics.map(t=>`<span class="topic-chip">${esc(t)}</span>`).join('')}</div>`}
   if(data.searchNote) html+=`<div class="error-note">${esc(data.searchNote)}</div>`;
+  if(data.searchEngines?.length) html+=`<div class=\"meta\">검색 경로: ${data.searchEngines.map(esc).join(' · ')}</div>`;
+  if(!data.total && data.searchLinks?.length) html+=`<div class=\"error-note\">검색 엔진에서 결과를 가져오지 못했습니다. 아래에서 같은 검색어를 직접 열어볼 수 있습니다.<br>${data.searchLinks.map(x=>`<a href=\"${safeUrl(x.url)}\" target=\"_blank\" rel=\"noopener noreferrer\">${esc(x.name)}에서 검색</a>`).join(' · ')}</div>`;
   html+=`</div>`;
   const groups=[['news','📰','관련 뉴스'],['column','📝','관련 칼럼·오피니언'],['official','🏛️','공식·1차 자료'],['factcheck','🔎','관련 팩트체크 자료']];
   for(const [key,icon,title] of groups){const arr=data.groups?.[key]||[];html+=`<section class="group"><h2 class="group-title">${icon} ${title} <span class="count">${arr.length}</span></h2>`;if(!arr.length)html+=`<div class="empty">이 종류의 자료를 찾지 못했습니다.</div>`;else html+=`<div class="material-grid">${arr.map(renderMaterial).join('')}</div>`;html+=`</section>`}
