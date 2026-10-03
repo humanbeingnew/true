@@ -1,9 +1,8 @@
-name = "fact-checker-free-v1"
+name = "related-material-finder-v2"
 main = "src/index.js"
-compatibility_date = "2026-10-01"
+compatibility_date = "2026-10-02"
 
 [assets]
 directory = "./public"
-
-[vars]
-APP_NAME = "근거 기반 자료 검증기"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
